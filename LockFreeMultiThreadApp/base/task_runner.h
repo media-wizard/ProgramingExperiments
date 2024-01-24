@@ -1,12 +1,11 @@
-#include <iostream>
+
+#ifndef TASK_RUNNER_H_
+#define TASK_RUNNER_H_
+
 #include <chrono>
 #include <condition_variable>
-#include <functional>
 #include <future>
-#include <memory>
 #include <mutex>
-#include <thread>
-#include <vector>
 #include <list>
 
 // Keep the order of enum types.
@@ -69,3 +68,5 @@ class RunnerManager {
   private:
     void StartThread(int type);
 };
+
+#endif // TASK_RUNNER_H_

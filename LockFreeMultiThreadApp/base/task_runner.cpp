@@ -1,5 +1,10 @@
 #include "task_runner.h"
 
+#include <functional>
+#include <iostream>
+#include <memory>
+#include <thread>
+
 namespace { // anonymous namespace - start
   std::vector<std::thread> g_runner_threads;
 

@@ -1,9 +1,12 @@
 /***
- * To Build: g++ -g -std=c++17 task_runner.cpp sample_app.cpp -lpthread -o sample_app
- * To Run: ./task_runner
+ * To Build: g++ -g -std=c++17 -Ibase base/task_runner.cpp sample_app.cpp -lpthread -o sample_app
+ * To Run: ./sample_app
  ***/
 
 #include "task_runner.h"
+
+#include <functional>
+#include <iostream>
 
 class MyApplication : public Application{
 public:
