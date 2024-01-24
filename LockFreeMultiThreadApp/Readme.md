@@ -1,9 +1,9 @@
 # Lock Free MultiThread App
 
 Protecting the shared resources is a nightmare in the multi-threaded programming.
-This design eliminates sharing the resources across threads.
+This design eliminates the need of sharing the resources across threads.
 
-Here, each thread is associated with a task runner. Each threads can **PostTask** or PostDelayedTask to the other threads.
+Here, each thread is associated with a task runner. Each threads can **PostTask** or **PostDelayedTask** to the other threads.
 
 eg:
 
