@@ -34,7 +34,7 @@ void IoManager::SendMessageToClient(int client_fd, std::string msg) {
 }
 
 void IoManager::SendMessageToClientInternal(int client_fd, std::string msg) {
-  MAKE_SURE_IO_THREAD(&IoManager::SendMessageToClient, client_fd, msg)
+  MAKE_SURE_IO_THREAD(&IoManager::SendMessageToClientInternal, client_fd, msg)
 
   send(client_fd, msg.c_str(), msg.length(), 0);
 }
