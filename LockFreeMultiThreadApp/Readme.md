@@ -4,7 +4,9 @@ Protecting the shared resources is a nightmare in the multi-threaded programming
 This design eliminates the need of sharing the resources across threads. Hence, the use of mutex in the application side too.
 
 Here, each thread is associated with a task runner. Each threads can **PostTask** or **PostDelayedTask** to the other threads.
+
 Under the hood task runner handles the locks to execute the tasks, which helps avoiding the use of locks in the applications.
+
 Note: It doesn't completely elimiate the locks; rather freeing up the app deveoper from the hassles of managing critical section.
 
 eg:
