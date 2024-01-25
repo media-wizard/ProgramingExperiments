@@ -1,8 +1,3 @@
-/***
- * To Build: g++ -g -std=c++17 task_runner.cpp sample_app.cpp -lpthread -o sample_app
- * To Run: ./task_runner
- ***/
-
 #include "io_manager.h"
 #include "task_runner.h"
 
