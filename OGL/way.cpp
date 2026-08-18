@@ -42,6 +42,12 @@ static bool g_paused = false;
 static bool g_cachedTextures = false;
 static const char *g_cachePath = "/tmp/waygl_texcache.bin";
 
+static double getTimeSeconds() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 static const char *kSpriteVS =
     "attribute vec2 aPos;\n"
     "attribute vec2 aUV;\n"
@@ -82,14 +88,23 @@ static const char *kTextFS =
     "uniform sampler2D uGlyph;\n"
     "uniform vec3 uColor;\n"
     "void main() {\n"
-    "  gl_FragColor = vec4(uColor, texture2D(uGlyph, vUV).r);\n"
+    "  float alpha = texture2D(uGlyph, vUV).a;\n"
+    "  gl_FragColor = vec4(uColor, alpha);\n"
     "}\n";
 
-static double getTimeSeconds() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
+static const char *kSolidVS =
+    "attribute vec2 aPos;\n"
+    "uniform mat4 uProj;\n"
+    "void main() {\n"
+    "  gl_Position = uProj * vec4(aPos, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *kSolidFS =
+    "precision mediump float;\n"
+    "uniform vec4 uColor;\n"
+    "void main() {\n"
+    "  gl_FragColor = uColor;\n"
+    "}\n";
 
 static void makeOrtho(float *m, float l, float r, float b, float t) {
     for (int i = 0; i < 16; ++i) m[i] = 0.0f;
@@ -144,13 +159,7 @@ struct Sprite {
     int tex;
 };
 
-struct Glyph {
-    GLuint tex;
-    int w, h;
-    int bearingX, bearingY;
-    int advance;
-};
-
+// 7x7 column-major bitmap font definitions
 static const uint8_t kNumericFont[13][7] = {
     {0x3E, 0x41, 0x41, 0x41, 0x41, 0x41, 0x3E}, // 0
     {0x00, 0x00, 0x42, 0x7F, 0x40, 0x00, 0x00}, // 1
@@ -161,30 +170,33 @@ static const uint8_t kNumericFont[13][7] = {
     {0x3E, 0x49, 0x49, 0x49, 0x49, 0x49, 0x32}, // 6
     {0x01, 0x01, 0x01, 0x79, 0x09, 0x09, 0x07}, // 7
     {0x36, 0x49, 0x49, 0x49, 0x49, 0x49, 0x36}, // 8
-    {0x06, 0x49, 0x49, 0x49, 0x49, 0x29, 0x1E}, // 9
-    {0x00, 0x00, 0x00, 0x36, 0x36, 0x00, 0x00}, // :
+    {0x26, 0x49, 0x49, 0x49, 0x49, 0x49, 0x3E}, // 9
+    {0x00, 0x00, 0x66, 0x66, 0x00, 0x00, 0x00}, // :
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // space
-    {0x00, 0x00, 0x0C, 0x12, 0x12, 0x0C, 0x00}, // .
+    {0x00, 0x00, 0x06, 0x06, 0x00, 0x00, 0x00}, // .
 };
 
 static GLuint createDigitAtlas() {
     const int cell = 8;
     const int atlasSize = 64;
     std::vector<unsigned char> pixels(atlasSize * atlasSize * 4, 0);
+
     for (int g = 0; g < 13; ++g) {
         int gx = (g % 8) * cell;
         int gy = (g / 8) * cell;
-        for (int row = 0; row < 7; ++row) {
-            for (int col = 0; col < 5; ++col) {
-                bool on = (kNumericFont[g][row] & (1 << (4 - col))) != 0;
-                int x = gx + col * 2 + 1;
-                int y = gy + row * 2 + 1;
+        for (int col = 0; col < 7; ++col) {
+            unsigned char b = kNumericFont[g][col];
+            for (int row = 0; row < 7; ++row) {
+                bool on = (b & (1 << row)) != 0;
+                int x = gx + col;
+                int y = gy + row;
                 if (x < atlasSize && y < atlasSize) {
                     size_t i = ((size_t)y * atlasSize + x) * 4;
+                    unsigned char val = on ? 255 : 0;
                     pixels[i + 0] = 255;
                     pixels[i + 1] = 255;
                     pixels[i + 2] = 255;
-                    pixels[i + 3] = on ? 255 : 0;
+                    pixels[i + 3] = val;
                 }
             }
         }
@@ -195,8 +207,8 @@ static GLuint createDigitAtlas() {
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, atlasSize, atlasSize, 0, GL_RGBA,
                  GL_UNSIGNED_BYTE, pixels.data());
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -209,38 +221,6 @@ static int glyphIndex(char ch) {
     if (ch == ' ') return 11;
     if (ch == '.') return 12;
     return 11;
-}
-
-static void drawTextSimple(GLuint fontTex, const std::string &text, float x, float y,
-                          float scale, float r, float g, float b, float *proj) {
-    const int atlasSize = 64;
-    const int cell = 8;
-    const float unit = 1.0f / (float)atlasSize;
-    float cursor = x;
-    for (size_t i = 0; i < text.size(); ++i) {
-        int idx = glyphIndex(text[i]);
-        int gx = (idx % 8) * cell;
-        int gy = (idx / 8) * cell;
-        float u0 = gx * unit;
-        float v0 = gy * unit;
-        float u1 = (gx + 8) * unit;
-        float v1 = (gy + 8) * unit;
-        float w = 8.0f * scale;
-        float h = 8.0f * scale;
-
-        float verts[6][4] = {
-            {cursor, y, u0, v1}, {cursor, y + h, u0, v0}, {cursor + w, y + h, u1, v0},
-            {cursor, y, u0, v1}, {cursor + w, y + h, u1, v0}, {cursor + w, y, u1, v1}
-        };
-
-        glBindTexture(GL_TEXTURE_2D, fontTex);
-        glEnableVertexAttribArray(0);
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-        cursor += 7.0f * scale;
-    }
 }
 
 static std::vector<GLuint> createTextureBank(int count, int size, size_t *bytesOut) {
@@ -298,8 +278,6 @@ static bool swapTexturesToDisk(std::vector<GLuint> &texs, int size, const char *
         return false;
     }
     std::vector<unsigned char> pixels((size_t)size * size * 4);
-
-    // Create a temporary FBO to bind textures for reading in GLES2
     GLuint fbo = 0;
     glGenFramebuffers(1, &fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -307,7 +285,6 @@ static bool swapTexturesToDisk(std::vector<GLuint> &texs, int size, const char *
     for (GLuint tex : texs) {
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
         glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-
         if (fwrite(pixels.data(), 1, pixels.size(), f) != pixels.size()) {
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glDeleteFramebuffers(1, &fbo);
@@ -315,11 +292,9 @@ static bool swapTexturesToDisk(std::vector<GLuint> &texs, int size, const char *
             return false;
         }
     }
-
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDeleteFramebuffers(1, &fbo);
     fclose(f);
-
     glDeleteTextures((GLsizei)texs.size(), texs.data());
     std::fill(texs.begin(), texs.end(), 0u);
     glFinish();
@@ -481,14 +456,24 @@ int main(int argc, char **argv) {
 
     GLuint spriteProg = linkProgram(kSpriteVS, kSpriteFS);
     GLuint textProg = linkProgram(kTextVS, kTextFS);
+    GLuint solidProg = linkProgram(kSolidVS, kSolidFS);
+
+    GLint spritePosLoc = glGetAttribLocation(spriteProg, "aPos");
+    GLint spriteUVLoc = glGetAttribLocation(spriteProg, "aUV");
     GLint spriteProj = glGetUniformLocation(spriteProg, "uProj");
     GLint spriteCenter = glGetUniformLocation(spriteProg, "uCenter");
     GLint spriteHalf = glGetUniformLocation(spriteProg, "uHalfSize");
     GLint spriteAngle = glGetUniformLocation(spriteProg, "uAngle");
     GLint spriteTint = glGetUniformLocation(spriteProg, "uTint");
+
+    GLint textVertexLoc = glGetAttribLocation(textProg, "aVertex");
     GLint textProj = glGetUniformLocation(textProg, "uProj");
     GLint textColor = glGetUniformLocation(textProg, "uColor");
     GLint textTex = glGetUniformLocation(textProg, "uGlyph");
+
+    GLint solidPosLoc = glGetAttribLocation(solidProg, "aPos");
+    GLint solidProj = glGetUniformLocation(solidProg, "uProj");
+    GLint solidColor = glGetUniformLocation(solidProg, "uColor");
 
     const float quad[] = {
         -1.0f, -1.0f, 0.0f, 0.0f,
@@ -535,9 +520,6 @@ int main(int argc, char **argv) {
     double prev = 0.0;
     double pausedTotal = 0.0;
     double pauseStart = 0.0;
-    int fpsFrames = 0;
-    double fpsAccum = 0.0;
-    double fps = 0.0;
 
     printf("OpenGL/Wayland application initialized successfully.\n");
 
@@ -575,20 +557,16 @@ int main(int argc, char **argv) {
         glClear(GL_COLOR_BUFFER_BIT);
 
         if (!g_paused) {
-            fpsAccum += dt;
-            if (++fpsFrames >= 30) {
-                fps = fpsFrames / fpsAccum;
-                fpsFrames = 0;
-                fpsAccum = 0.0;
-            }
             glUseProgram(spriteProg);
             glUniformMatrix4fv(spriteProj, 1, GL_FALSE, proj);
             glActiveTexture(GL_TEXTURE0);
+
             glBindBuffer(GL_ARRAY_BUFFER, quadVbo);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
-            glEnableVertexAttribArray(1);
-            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+            glEnableVertexAttribArray(spritePosLoc);
+            glVertexAttribPointer(spritePosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+            glEnableVertexAttribArray(spriteUVLoc);
+            glVertexAttribPointer(spriteUVLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+
             for (Sprite &s : sprites) {
                 s.x += s.vx * (float)dt;
                 s.y += s.vy * (float)dt;
@@ -604,13 +582,11 @@ int main(int argc, char **argv) {
                 glUniform4f(spriteTint, s.r, s.g, s.b, s.a);
                 glDrawArrays(GL_TRIANGLES, 0, 6);
             }
+            glDisableVertexAttribArray(spritePosLoc);
+            glDisableVertexAttribArray(spriteUVLoc);
         }
 
-        glUseProgram(textProg);
-        glUniformMatrix4fv(textProj, 1, GL_FALSE, proj);
-        glUniform1i(textTex, 0);
-        glUniform3f(textColor, 1.0f, 1.0f, 1.0f);
-
+        // Format Clock and Elapsed Time text
         char clockBuf[32];
         time_t now_t = time(NULL);
         struct tm tm_info;
@@ -619,15 +595,45 @@ int main(int argc, char **argv) {
         double elapsed = now - start - pausedTotal;
         char secondsBuf[32];
         snprintf(secondsBuf, sizeof(secondsBuf), "%.1f", elapsed);
-
         std::string timeText = std::string(clockBuf) + "  " + secondsBuf;
+
+        float scale = 2.5f;
+        float textWidth = timeText.size() * 7.0f * scale;
+        float sx = (WIN_W - textWidth) * 0.5f;
+        float sy = 15.0f;
+
+        // 1. Draw semi-transparent background panel
+        glUseProgram(solidProg);
+        glUniformMatrix4fv(solidProj, 1, GL_FALSE, proj);
+        glUniform4f(solidColor, 0.0f, 0.0f, 0.0f, 0.75f);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+        float padX = 12.0f;
+        float padY = 8.0f;
+        float bgRect[6][2] = {
+            {sx - padX, sy - padY},
+            {sx + textWidth + padX, sy - padY},
+            {sx + textWidth + padX, sy + (8.0f * scale) + padY},
+            {sx - padX, sy - padY},
+            {sx + textWidth + padX, sy + (8.0f * scale) + padY},
+            {sx - padX, sy + (8.0f * scale) + padY}
+        };
+
+        glEnableVertexAttribArray(solidPosLoc);
+        glVertexAttribPointer(solidPosLoc, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), bgRect);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glDisableVertexAttribArray(solidPosLoc);
+
+        // 2. Render Text Glyphs
+        glUseProgram(textProg);
+        glUniformMatrix4fv(textProj, 1, GL_FALSE, proj);
+        glUniform1i(textTex, 0);
+        glUniform3f(textColor, 1.0f, 1.0f, 1.0f);
+
+        glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, fontTex);
-        glEnableVertexAttribArray(0);
-        glEnableVertexAttribArray(1);
-        glDisable(GL_DEPTH_TEST);
-        // draw clock in top center
-        float sx = (WIN_W - (timeText.size() * 7.0f * 1.2f)) * 0.5f;
-        float sy = 20.0f;
+        glEnableVertexAttribArray(textVertexLoc);
+
         for (size_t i = 0; i < timeText.size(); ++i) {
             int idx = glyphIndex(timeText[i]);
             int gx = (idx % 8) * 8;
@@ -636,43 +642,23 @@ int main(int argc, char **argv) {
             float v0 = gy / 64.0f;
             float u1 = (gx + 8) / 64.0f;
             float v1 = (gy + 8) / 64.0f;
-            float w = 8.0f * 1.2f;
-            float h = 8.0f * 1.2f;
-            float verts[6][4] = {
-                {sx, sy, u0, v1}, {sx, sy + h, u0, v0}, {sx + w, sy + h, u1, v0},
-                {sx, sy, u0, v1}, {sx + w, sy + h, u1, v0}, {sx + w, sy, u1, v1}
-            };
-            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts);
-            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
-            glDrawArrays(GL_TRIANGLES, 0, 6);
-            sx += 7.0f * 1.2f;
-        }
+            float w = 8.0f * scale;
+            float h = 8.0f * scale;
 
-        if (g_paused) {
-            char pausedText[32];
-            snprintf(pausedText, sizeof(pausedText), "PAUSED");
-            float px = (WIN_W - (strlen(pausedText) * 7.0f * 1.0f)) * 0.5f;
-            float py = WIN_H * 0.5f;
-            for (size_t i = 0; i < strlen(pausedText); ++i) {
-                int idx = glyphIndex(pausedText[i]);
-                int gx = (idx % 8) * 8;
-                int gy = (idx / 8) * 8;
-                float u0 = gx / 64.0f;
-                float v0 = gy / 64.0f;
-                float u1 = (gx + 8) / 64.0f;
-                float v1 = (gy + 8) / 64.0f;
-                float w = 8.0f;
-                float h = 8.0f;
-                float verts[6][4] = {
-                    {px, py, u0, v1}, {px, py + h, u0, v0}, {px + w, py + h, u1, v0},
-                    {px, py, u0, v1}, {px + w, py + h, u1, v0}, {px + w, py, u1, v1}
-                };
-                glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts);
-                glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
-                glDrawArrays(GL_TRIANGLES, 0, 6);
-                px += 7.0f;
-            }
+            float verts[6][4] = {
+                {sx,     sy,     u0, v0},
+                {sx,     sy + h, u0, v1},
+                {sx + w, sy + h, u1, v1},
+
+                {sx,     sy,     u0, v0},
+                {sx + w, sy + h, u1, v1},
+                {sx + w, sy,     u1, v0}
+            };
+            glVertexAttribPointer(textVertexLoc, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            sx += 7.0f * scale;
         }
+        glDisableVertexAttribArray(textVertexLoc);
 
         eglSwapBuffers(egl_display, egl_surface);
         wl_display_flush(display);
@@ -683,6 +669,7 @@ int main(int argc, char **argv) {
     glDeleteBuffers(1, &quadVbo);
     glDeleteProgram(spriteProg);
     glDeleteProgram(textProg);
+    glDeleteProgram(solidProg);
     eglDestroySurface(egl_display, egl_surface);
     wl_egl_window_destroy(egl_window);
     xdg_toplevel_destroy(xdg_toplevel);
@@ -695,3 +682,4 @@ int main(int argc, char **argv) {
     wl_display_disconnect(display);
     return 0;
 }
+
