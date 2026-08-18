@@ -38,6 +38,7 @@ static int TEX_COUNT = 192;
 static int TEX_SIZE = 512;
 static int SPRITE_COUNT = 1500;
 static bool g_pauseRequested = false;
+static bool g_quitRequested = false;
 static bool g_paused = false;
 static bool g_cachedTextures = false;
 static const char *g_cachePath = "/tmp/waygl_texcache.bin";
@@ -346,8 +347,12 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *keyboard, uint
                                  struct wl_surface *surface) {}
 static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                                uint32_t time, uint32_t key, uint32_t state) {
-    if (state == WL_KEYBOARD_KEY_STATE_PRESSED && (key == 57 || key == 65)) {
-        g_pauseRequested = true;
+    if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+     	if (key == 57 || key == 65) {
+        	g_pauseRequested = true;
+        } else if (key == 16) {
+        	g_quitRequested = true;
+        }
     }
 }
 static void keyboard_handle_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
@@ -520,6 +525,7 @@ int main(int argc, char **argv) {
     double prev = 0.0;
     double pausedTotal = 0.0;
     double pauseStart = 0.0;
+    time_t pauseWallTime = 0;
 
     printf("OpenGL/Wayland application initialized successfully.\n");
 
@@ -532,14 +538,20 @@ int main(int argc, char **argv) {
         double dt = now - prev;
         prev = now;
 
+	if (g_quitRequested) {
+  	    printf("Exiting\n");
+	    break;
+	}
+
         if (g_pauseRequested) {
             g_pauseRequested = false;
             if (!g_paused) {
                 pauseStart = now;
+                pauseWallTime = time(NULL);
                 if (swapTexturesToDisk(textures, TEX_SIZE, g_cachePath)) {
                     g_paused = true;
                     g_cachedTextures = true;
-                    printf("Texture data swapped to disk.\n");
+                    printf("%.1f MiB Texture data swapped to file %s.\n", texBytes / (1024.0 * 1024.0), g_cachePath);
                 }
             } else {
                 if (swapTexturesFromDisk(textures, TEX_SIZE, g_cachePath)) {
@@ -586,13 +598,17 @@ int main(int argc, char **argv) {
             glDisableVertexAttribArray(spriteUVLoc);
         }
 
-        // Format Clock and Elapsed Time text
-        char clockBuf[32];
-        time_t now_t = time(NULL);
+        // Format Clock and Elapsed Time text (freezes while paused)
+        double currentRenderTime = g_paused ? pauseStart : now;
+        double elapsed = currentRenderTime - start - pausedTotal;
+        if (elapsed < 0.0) elapsed = 0.0;
+
+        time_t render_t = g_paused ? pauseWallTime : time(NULL);
         struct tm tm_info;
-        localtime_r(&now_t, &tm_info);
+        localtime_r(&render_t, &tm_info);
+
+        char clockBuf[32];
         strftime(clockBuf, sizeof(clockBuf), "%H:%M:%S", &tm_info);
-        double elapsed = now - start - pausedTotal;
         char secondsBuf[32];
         snprintf(secondsBuf, sizeof(secondsBuf), "%.1f", elapsed);
         std::string timeText = std::string(clockBuf) + "  " + secondsBuf;
@@ -682,4 +698,3 @@ int main(int argc, char **argv) {
     wl_display_disconnect(display);
     return 0;
 }
-
