@@ -43,13 +43,18 @@ static bool g_paused = false;
 static bool g_cachedTextures = false;
 static const char *g_cachePath = "/tmp/waygl_texcache.bin";
 
+// CPU buffer cache to avoid GLES FBO glReadPixels bugs on Mali TBDR GPUs
+static std::vector<unsigned char> g_textureCpuCache;
+
 static double getTimeSeconds() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+// Fixed shader precision qualifiers for Mali GLSL ES compliance
 static const char *kSpriteVS =
+    "precision mediump float;\n"
     "attribute vec2 aPos;\n"
     "attribute vec2 aUV;\n"
     "uniform mat4 uProj;\n"
@@ -75,6 +80,7 @@ static const char *kSpriteFS =
     "}\n";
 
 static const char *kTextVS =
+    "precision mediump float;\n"
     "attribute vec4 aVertex;\n"
     "uniform mat4 uProj;\n"
     "varying vec2 vUV;\n"
@@ -94,6 +100,7 @@ static const char *kTextFS =
     "}\n";
 
 static const char *kSolidVS =
+    "precision mediump float;\n"
     "attribute vec2 aPos;\n"
     "uniform mat4 uProj;\n"
     "void main() {\n"
@@ -160,7 +167,6 @@ struct Sprite {
     int tex;
 };
 
-// 7x7 column-major bitmap font definitions
 static const uint8_t kNumericFont[13][7] = {
     {0x3E, 0x41, 0x41, 0x41, 0x41, 0x41, 0x3E}, // 0
     {0x00, 0x00, 0x42, 0x7F, 0x40, 0x00, 0x00}, // 1
@@ -224,12 +230,26 @@ static int glyphIndex(char ch) {
     return 11;
 }
 
+static void uploadTexture(GLuint tex, int size, const unsigned char *pixels) {
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 static std::vector<GLuint> createTextureBank(int count, int size, size_t *bytesOut) {
     std::vector<GLuint> texs(count, 0);
-    std::vector<unsigned char> pixels((size_t)size * size * 4);
+    size_t singleTexBytes = (size_t)size * size * 4;
+    g_textureCpuCache.resize(count * singleTexBytes);
+
     std::mt19937 rng(1337);
     glGenTextures(count, texs.data());
     for (int i = 0; i < count; ++i) {
+        unsigned char *pixels = &g_textureCpuCache[i * singleTexBytes];
         float hue = (float)i / (float)count * 6.2831853f;
         float r = 0.5f + 0.5f * sin(hue);
         float g = 0.5f + 0.5f * sin(hue + 2.094f);
@@ -247,29 +267,11 @@ static std::vector<GLuint> createTextureBank(int count, int size, size_t *bytesO
                 pixels[off + 3] = 255;
             }
         }
-        glBindTexture(GL_TEXTURE_2D, texs[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-        glGenerateMipmap(GL_TEXTURE_2D);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        uploadTexture(texs[i], size, pixels);
     }
-    glBindTexture(GL_TEXTURE_2D, 0);
     size_t base = (size_t)count * size * size * 4;
     *bytesOut = base + base / 3;
     return texs;
-}
-
-static void uploadTexture(GLuint tex, int size, const unsigned char *pixels) {
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    glGenerateMipmap(GL_TEXTURE_2D);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 static bool swapTexturesToDisk(std::vector<GLuint> &texs, int size, const char *path) {
@@ -278,27 +280,13 @@ static bool swapTexturesToDisk(std::vector<GLuint> &texs, int size, const char *
         fprintf(stderr, "Cannot open cache file %s\n", path);
         return false;
     }
-    std::vector<unsigned char> pixels((size_t)size * size * 4);
-    GLuint fbo = 0;
-    glGenFramebuffers(1, &fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-
-    for (GLuint tex : texs) {
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
-        glReadPixels(0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-        if (fwrite(pixels.data(), 1, pixels.size(), f) != pixels.size()) {
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glDeleteFramebuffers(1, &fbo);
-            fclose(f);
-            return false;
-        }
+    if (fwrite(g_textureCpuCache.data(), 1, g_textureCpuCache.size(), f) != g_textureCpuCache.size()) {
+        fclose(f);
+        return false;
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glDeleteFramebuffers(1, &fbo);
     fclose(f);
     glDeleteTextures((GLsizei)texs.size(), texs.data());
     std::fill(texs.begin(), texs.end(), 0u);
-    glFinish();
     return true;
 }
 
@@ -308,18 +296,18 @@ static bool swapTexturesFromDisk(std::vector<GLuint> &texs, int size, const char
         fprintf(stderr, "Cannot open cache file %s\n", path);
         return false;
     }
-    std::vector<unsigned char> pixels((size_t)size * size * 4);
-    glGenTextures((GLsizei)texs.size(), texs.data());
-    for (size_t i = 0; i < texs.size(); ++i) {
-        if (fread(pixels.data(), 1, pixels.size(), f) != pixels.size()) {
-            fclose(f);
-            return false;
-        }
-        uploadTexture(texs[i], size, pixels.data());
+    if (fread(g_textureCpuCache.data(), 1, g_textureCpuCache.size(), f) != g_textureCpuCache.size()) {
+        fclose(f);
+        return false;
     }
     fclose(f);
     remove(path);
-    glFinish();
+
+    size_t singleTexBytes = (size_t)size * size * 4;
+    glGenTextures((GLsizei)texs.size(), texs.data());
+    for (size_t i = 0; i < texs.size(); ++i) {
+        uploadTexture(texs[i], size, &g_textureCpuCache[i * singleTexBytes]);
+    }
     return true;
 }
 
@@ -348,10 +336,10 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *keyboard, uint
 static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                                uint32_t time, uint32_t key, uint32_t state) {
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-     	if (key == 57 || key == 65) {
-        	g_pauseRequested = true;
+        if (key == 57 || key == 65) {
+            g_pauseRequested = true;
         } else if (key == 16) {
-        	g_quitRequested = true;
+            g_quitRequested = true;
         }
     }
 }
@@ -418,6 +406,7 @@ int main(int argc, char **argv) {
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
         EGL_NONE
     };
@@ -463,6 +452,11 @@ int main(int argc, char **argv) {
     GLuint textProg = linkProgram(kTextVS, kTextFS);
     GLuint solidProg = linkProgram(kSolidVS, kSolidFS);
 
+    // Bind explicit sampler uniforms
+    GLint spriteTexLoc = glGetUniformLocation(spriteProg, "uTex");
+    glUseProgram(spriteProg);
+    glUniform1i(spriteTexLoc, 0);
+
     GLint spritePosLoc = glGetAttribLocation(spriteProg, "aPos");
     GLint spriteUVLoc = glGetAttribLocation(spriteProg, "aUV");
     GLint spriteProj = glGetUniformLocation(spriteProg, "uProj");
@@ -494,6 +488,10 @@ int main(int argc, char **argv) {
     glBindBuffer(GL_ARRAY_BUFFER, quadVbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    // Dynamic VBO for HUD drawing to eliminate non-VBO client pointer issues
+    GLuint dynamicVbo = 0;
+    glGenBuffers(1, &dynamicVbo);
 
     size_t texBytes = 0;
     std::vector<GLuint> textures = createTextureBank(TEX_COUNT, TEX_SIZE, &texBytes);
@@ -538,10 +536,10 @@ int main(int argc, char **argv) {
         double dt = now - prev;
         prev = now;
 
-	if (g_quitRequested) {
-  	    printf("Exiting\n");
-	    break;
-	}
+        if (g_quitRequested) {
+            printf("Exiting\n");
+            break;
+        }
 
         if (g_pauseRequested) {
             g_pauseRequested = false;
@@ -598,7 +596,6 @@ int main(int argc, char **argv) {
             glDisableVertexAttribArray(spriteUVLoc);
         }
 
-        // Format Clock and Elapsed Time text (freezes while paused)
         double currentRenderTime = g_paused ? pauseStart : now;
         double elapsed = currentRenderTime - start - pausedTotal;
         if (elapsed < 0.0) elapsed = 0.0;
@@ -618,11 +615,10 @@ int main(int argc, char **argv) {
         float sx = (WIN_W - textWidth) * 0.5f;
         float sy = 15.0f;
 
-        // 1. Draw semi-transparent background panel
+        // 1. Draw semi-transparent background panel via dynamic VBO
         glUseProgram(solidProg);
         glUniformMatrix4fv(solidProj, 1, GL_FALSE, proj);
         glUniform4f(solidColor, 0.0f, 0.0f, 0.0f, 0.75f);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
 
         float padX = 12.0f;
         float padY = 8.0f;
@@ -635,12 +631,14 @@ int main(int argc, char **argv) {
             {sx - padX, sy + (8.0f * scale) + padY}
         };
 
+        glBindBuffer(GL_ARRAY_BUFFER, dynamicVbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(bgRect), bgRect, GL_DYNAMIC_DRAW);
         glEnableVertexAttribArray(solidPosLoc);
-        glVertexAttribPointer(solidPosLoc, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), bgRect);
+        glVertexAttribPointer(solidPosLoc, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
         glDrawArrays(GL_TRIANGLES, 0, 6);
         glDisableVertexAttribArray(solidPosLoc);
 
-        // 2. Render Text Glyphs
+        // 2. Render Text Glyphs via VBO
         glUseProgram(textProg);
         glUniformMatrix4fv(textProj, 1, GL_FALSE, proj);
         glUniform1i(textTex, 0);
@@ -670,11 +668,13 @@ int main(int argc, char **argv) {
                 {sx + w, sy + h, u1, v1},
                 {sx + w, sy,     u1, v0}
             };
-            glVertexAttribPointer(textVertexLoc, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+            glVertexAttribPointer(textVertexLoc, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
             glDrawArrays(GL_TRIANGLES, 0, 6);
             sx += 7.0f * scale;
         }
         glDisableVertexAttribArray(textVertexLoc);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
 
         eglSwapBuffers(egl_display, egl_surface);
         wl_display_flush(display);
@@ -683,6 +683,7 @@ int main(int argc, char **argv) {
     glDeleteTextures((GLsizei)textures.size(), textures.data());
     glDeleteTextures(1, &fontTex);
     glDeleteBuffers(1, &quadVbo);
+    glDeleteBuffers(1, &dynamicVbo);
     glDeleteProgram(spriteProg);
     glDeleteProgram(textProg);
     glDeleteProgram(solidProg);
