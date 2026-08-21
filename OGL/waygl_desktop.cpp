@@ -11,7 +11,12 @@
 #include <wayland-client.h>
 #include <wayland-egl.h>
 #include <EGL/egl.h>
-#include <GLES2/gl2.h>
+
+// Enable desktop OpenGL extension prototypes before including standard GL headers
+#define GL_GLEXT_PROTOTYPES 1
+#include <GL/gl.h>
+#include <GL/glext.h>
+
 #include "xdg-shell-client-protocol.h"
 
 // Global Wayland variables
@@ -43,18 +48,14 @@ static bool g_paused = false;
 static bool g_cachedTextures = false;
 static const char *g_cachePath = "/tmp/waygl_texcache.bin";
 
-// CPU buffer cache to avoid GLES FBO glReadPixels bugs on Mali TBDR GPUs
-static std::vector<unsigned char> g_textureCpuCache;
-
 static double getTimeSeconds() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-// Fixed shader precision qualifiers for Mali GLSL ES compliance
+// Removed GLES precision qualifiers for Desktop OpenGL compliance
 static const char *kSpriteVS =
-    "precision mediump float;\n"
     "attribute vec2 aPos;\n"
     "attribute vec2 aUV;\n"
     "uniform mat4 uProj;\n"
@@ -71,7 +72,6 @@ static const char *kSpriteVS =
     "}\n";
 
 static const char *kSpriteFS =
-    "precision mediump float;\n"
     "varying vec2 vUV;\n"
     "uniform sampler2D uTex;\n"
     "uniform vec4 uTint;\n"
@@ -80,7 +80,6 @@ static const char *kSpriteFS =
     "}\n";
 
 static const char *kTextVS =
-    "precision mediump float;\n"
     "attribute vec4 aVertex;\n"
     "uniform mat4 uProj;\n"
     "varying vec2 vUV;\n"
@@ -90,7 +89,6 @@ static const char *kTextVS =
     "}\n";
 
 static const char *kTextFS =
-    "precision mediump float;\n"
     "varying vec2 vUV;\n"
     "uniform sampler2D uGlyph;\n"
     "uniform vec3 uColor;\n"
@@ -100,7 +98,6 @@ static const char *kTextFS =
     "}\n";
 
 static const char *kSolidVS =
-    "precision mediump float;\n"
     "attribute vec2 aPos;\n"
     "uniform mat4 uProj;\n"
     "void main() {\n"
@@ -108,7 +105,6 @@ static const char *kSolidVS =
     "}\n";
 
 static const char *kSolidFS =
-    "precision mediump float;\n"
     "uniform vec4 uColor;\n"
     "void main() {\n"
     "  gl_FragColor = uColor;\n"
@@ -244,12 +240,13 @@ static void uploadTexture(GLuint tex, int size, const unsigned char *pixels) {
 static std::vector<GLuint> createTextureBank(int count, int size, size_t *bytesOut) {
     std::vector<GLuint> texs(count, 0);
     size_t singleTexBytes = (size_t)size * size * 4;
-    g_textureCpuCache.resize(count * singleTexBytes);
+
+    std::vector<unsigned char> localPixels(singleTexBytes);
 
     std::mt19937 rng(1337);
     glGenTextures(count, texs.data());
     for (int i = 0; i < count; ++i) {
-        unsigned char *pixels = &g_textureCpuCache[i * singleTexBytes];
+        unsigned char *pixels = localPixels.data();
         float hue = (float)i / (float)count * 6.2831853f;
         float r = 0.5f + 0.5f * sin(hue);
         float g = 0.5f + 0.5f * sin(hue + 2.094f);
@@ -280,11 +277,23 @@ static bool swapTexturesToDisk(std::vector<GLuint> &texs, int size, const char *
         fprintf(stderr, "Cannot open cache file %s\n", path);
         return false;
     }
-    if (fwrite(g_textureCpuCache.data(), 1, g_textureCpuCache.size(), f) != g_textureCpuCache.size()) {
-        fclose(f);
-        return false;
+
+    size_t singleTexBytes = (size_t)size * size * 4;
+    std::vector<unsigned char> tempPixels(singleTexBytes);
+
+    for (size_t i = 0; i < texs.size(); ++i) {
+        glBindTexture(GL_TEXTURE_2D, texs[i]);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, tempPixels.data());
+        
+        if (fwrite(tempPixels.data(), 1, singleTexBytes, f) != singleTexBytes) {
+            fclose(f);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            return false;
+        }
     }
+    glBindTexture(GL_TEXTURE_2D, 0);
     fclose(f);
+    
     glDeleteTextures((GLsizei)texs.size(), texs.data());
     std::fill(texs.begin(), texs.end(), 0u);
     return true;
@@ -296,18 +305,21 @@ static bool swapTexturesFromDisk(std::vector<GLuint> &texs, int size, const char
         fprintf(stderr, "Cannot open cache file %s\n", path);
         return false;
     }
-    if (fread(g_textureCpuCache.data(), 1, g_textureCpuCache.size(), f) != g_textureCpuCache.size()) {
-        fclose(f);
-        return false;
+
+    size_t singleTexBytes = (size_t)size * size * 4;
+    std::vector<unsigned char> tempPixels(singleTexBytes);
+
+    glGenTextures((GLsizei)texs.size(), texs.data());
+    for (size_t i = 0; i < texs.size(); ++i) {
+        if (fread(tempPixels.data(), 1, singleTexBytes, f) != singleTexBytes) {
+            fclose(f);
+            return false;
+        }
+        uploadTexture(texs[i], size, tempPixels.data());
     }
     fclose(f);
     remove(path);
 
-    size_t singleTexBytes = (size_t)size * size * 4;
-    glGenTextures((GLsizei)texs.size(), texs.data());
-    for (size_t i = 0; i < texs.size(); ++i) {
-        uploadTexture(texs[i], size, &g_textureCpuCache[i * singleTexBytes]);
-    }
     return true;
 }
 
@@ -336,9 +348,9 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *keyboard, uint
 static void keyboard_handle_key(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                                uint32_t time, uint32_t key, uint32_t state) {
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-        if (key == 57 || key == 65) {
+        if (key == 57 || key == 65) { // Space
             g_pauseRequested = true;
-        } else if (key == 16) {
+        } else if (key == 16) { // Q
             g_quitRequested = true;
         }
     }
@@ -395,6 +407,9 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    // Force Desktop OpenGL API for EGL
+    eglBindAPI(EGL_OPENGL_API);
+
     egl_display = eglGetDisplay((EGLNativeDisplayType)display);
     if (egl_display == EGL_NO_DISPLAY || !eglInitialize(egl_display, NULL, NULL)) {
         fprintf(stderr, "Failed to initialize EGL.\n");
@@ -407,17 +422,18 @@ int main(int argc, char **argv) {
         EGL_GREEN_SIZE, 8,
         EGL_BLUE_SIZE, 8,
         EGL_ALPHA_SIZE, 8,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
         EGL_NONE
     };
+    
     EGLint num_configs = 0;
     if (!eglChooseConfig(egl_display, config_attribs, &egl_config, 1, &num_configs) || num_configs == 0) {
         fprintf(stderr, "Failed to choose EGL config.\n");
         return -1;
     }
 
+    // Default Desktop OpenGL Context
     EGLint context_attribs[] = {
-        EGL_CONTEXT_CLIENT_VERSION, 2,
         EGL_NONE
     };
     egl_context = eglCreateContext(egl_display, egl_config, EGL_NO_CONTEXT, context_attribs);
@@ -430,7 +446,7 @@ int main(int argc, char **argv) {
     xdg_surface = xdg_wm_base_get_xdg_surface(wm_base, surface);
     xdg_surface_add_listener(xdg_surface, &xdg_surface_listener, NULL);
     xdg_toplevel = xdg_surface_get_toplevel(xdg_surface);
-    xdg_toplevel_set_title(xdg_toplevel, "Wayland EGL Window");
+    xdg_toplevel_set_title(xdg_toplevel, "Wayland EGL Window (Desktop GL)");
     wl_surface_commit(surface);
     wl_display_roundtrip(display);
 
@@ -442,6 +458,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to make EGL context current.\n");
         return -1;
     }
+
+    // Generate and bind a global VAO for strict Desktop GL compliance
+    GLuint vao;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
 
     glViewport(0, 0, width, height);
     glClearColor(0.05f, 0.06f, 0.09f, 1.0f);
@@ -549,7 +570,8 @@ int main(int argc, char **argv) {
                 if (swapTexturesToDisk(textures, TEX_SIZE, g_cachePath)) {
                     g_paused = true;
                     g_cachedTextures = true;
-                    printf("%.1f MiB Texture data swapped to file %s.\n", texBytes / (1024.0 * 1024.0), g_cachePath);
+                    size_t swappedBytes = (size_t)textures.size() * TEX_SIZE * TEX_SIZE * 4;
+                    printf("%.1f MiB Texture data swapped to file %s.\n", swappedBytes / (1024.0 * 1024.0), g_cachePath);
                 }
             } else {
                 if (swapTexturesFromDisk(textures, TEX_SIZE, g_cachePath)) {
@@ -680,6 +702,7 @@ int main(int argc, char **argv) {
         wl_display_flush(display);
     }
 
+    glDeleteVertexArrays(1, &vao);
     glDeleteTextures((GLsizei)textures.size(), textures.data());
     glDeleteTextures(1, &fontTex);
     glDeleteBuffers(1, &quadVbo);
